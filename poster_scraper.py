@@ -16,6 +16,7 @@ import re
 import os
 import hashlib
 import base64
+from datetime import datetime
 import threading
 from urllib.parse import quote_plus
 from config import Config
@@ -33,7 +34,23 @@ RATE_LIMIT_MARKERS = (
     "too many requests",
     "checking your browser before accessing",
     "attention required",
-    "cloudflare",
+    "just a moment",
+    "verify you are human",
+    "cf-chl",
+    "managed challenge",
+)
+RATE_LIMIT_URL_MARKERS = (
+    "/cdn-cgi/challenge-platform",
+    "challenge-platform",
+    "captcha",
+    "managed-challenge",
+)
+RATE_LIMIT_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "one more step",
+    "checking your browser",
 )
 
 
@@ -44,6 +61,7 @@ class TPDBSessionExpired(Exception):
 class TPDBRateLimited(Exception):
     """Raised when TPDB responds with a likely rate-limit/challenge page."""
 
+
 def _iter_file_chunks(file_obj, chunk_size=1024 * 1024):
     while True:
         data = file_obj.read(chunk_size)
@@ -51,14 +69,55 @@ def _iter_file_chunks(file_obj, chunk_size=1024 * 1024):
             break
         yield data
 
+
 def _is_login_url(url):
     return "/login" in (url or "").lower()
 
 
-def _raise_if_rate_limited(page_source, current_url):
+def _is_rate_limit_url(current_url):
+    url_lower = (current_url or "").lower()
+    return any(marker in url_lower for marker in RATE_LIMIT_URL_MARKERS)
+
+
+def _extract_html_title(page_source):
+    if not page_source:
+        return ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", page_source, flags=re.IGNORECASE | re.DOTALL)
+    if not title_match:
+        return ""
+    return re.sub(r"\s+", " ", title_match.group(1)).strip()
+
+
+def _write_tpdb_debug_snapshot(page_source, context_label):
+    should_snapshot = getattr(Config, "TPDB_DEBUG_SNAPSHOTS", getattr(Config, "DEBUG", False))
+    if not should_snapshot:
+        return None
+    try:
+        os.makedirs(Config.LOG_DIR, exist_ok=True)
+        safe_context = re.sub(r"[^a-zA-Z0-9_-]+", "_", (context_label or "tpdb"))
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        snapshot_path = os.path.join(Config.LOG_DIR, f"tpdb_{safe_context}_{timestamp}.html")
+        with open(snapshot_path, "w", encoding="utf-8") as snapshot_file:
+            snapshot_file.write(page_source or "")
+        return snapshot_path
+    except Exception as snapshot_error:
+        logging.warning(f"Failed to write TPDB debug snapshot: {snapshot_error}")
+        return None
+
+
+def _raise_if_rate_limited(page_source, current_url, context_label="search", check_content_markers=True):
     page_lower = (page_source or "").lower()
-    if any(marker in page_lower for marker in RATE_LIMIT_MARKERS):
-        raise TPDBRateLimited(f"TPDB returned a rate-limit/challenge page at {current_url or 'unknown URL'}")
+    title = (_extract_html_title(page_source) or "unknown title")
+    title_lower = title.lower()
+    title_looks_challenge = any(marker in title_lower for marker in RATE_LIMIT_TITLE_MARKERS)
+    page_looks_challenge = check_content_markers and any(marker in page_lower for marker in RATE_LIMIT_MARKERS)
+
+    if _is_rate_limit_url(current_url) or title_looks_challenge or page_looks_challenge:
+        snapshot_path = _write_tpdb_debug_snapshot(page_source, f"{context_label}_challenge")
+        details = f"TPDB returned a rate-limit/challenge page at {current_url or 'unknown URL'} (title: {title})"
+        if snapshot_path:
+            details += f". Snapshot: {snapshot_path}"
+        raise TPDBRateLimited(details)
 
 
 def _wait_for_search_results_ready(driver, timeout=15):
@@ -69,6 +128,7 @@ def _wait_for_search_results_ready(driver, timeout=15):
             or "0 results" in (d.page_source or "").lower()
         )
     except TimeoutException as exc:
+        _raise_if_rate_limited(driver.page_source, driver.current_url, "search_timeout")
         raise TimeoutError("Timed out waiting for TPDB search results page to load.") from exc
 
 
@@ -80,6 +140,7 @@ def _wait_for_item_posters_ready(driver, timeout=15):
             or "no poster" in (d.page_source or "").lower()
         )
     except TimeoutException as exc:
+        _raise_if_rate_limited(driver.page_source, driver.current_url, "item_timeout")
         raise TimeoutError("Timed out waiting for TPDB item poster page to load.") from exc
 
 
@@ -113,12 +174,36 @@ def setup_selenium_and_login(force=False):
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_argument("--lang=en-US")
+            chrome_options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option("useAutomationExtension", False)
             selenium_driver = webdriver.Chrome(options=chrome_options)
             selenium_driver.set_page_load_timeout(30)
+            try:
+                selenium_driver.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
+                )
+            except Exception:
+                # Non-fatal if CDP is unavailable in some Selenium/driver combinations.
+                pass
             created_driver = True
 
         try:
             selenium_driver.get("https://theposterdb.com/login")
+            # The regular sign-in page can contain challenge-related keywords in embedded scripts.
+            # For this initial page load, rely on URL/title checks only to avoid false positives.
+            _raise_if_rate_limited(
+                selenium_driver.page_source,
+                selenium_driver.current_url,
+                "login",
+                check_content_markers=False,
+            )
             WebDriverWait(selenium_driver, 15).until(EC.presence_of_element_located((By.NAME, "login")))
 
             email_input = selenium_driver.find_element(By.NAME, "login")
@@ -130,6 +215,14 @@ def setup_selenium_and_login(force=False):
             password_input.send_keys(Keys.RETURN)
 
             WebDriverWait(selenium_driver, 20).until(lambda d: not _is_login_url(d.current_url))
+            # After sign-in, /feed is expected. Avoid content-marker checks here because
+            # regular TPDB pages can include Cloudflare-related script text.
+            _raise_if_rate_limited(
+                selenium_driver.page_source,
+                selenium_driver.current_url,
+                "login_submit",
+                check_content_markers=False,
+            )
             if _is_login_url(selenium_driver.current_url):
                 raise RuntimeError("TPDB login failed: still on /login after submitting credentials.")
 
@@ -318,7 +411,7 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
 
     try:
         poster_urls = []
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 with selenium_lock:
                     if not selenium_driver:
@@ -330,7 +423,7 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
                         logging.warning("TPDB session expired on search page for '%s' (%s).", item_title, current_url)
                         raise TPDBSessionExpired("TPDB session expired while loading search page.")
 
-                    _raise_if_rate_limited(selenium_driver.page_source, current_url)
+                    _raise_if_rate_limited(selenium_driver.page_source, current_url, "search_page")
                     _wait_for_search_results_ready(selenium_driver, timeout=15)
                     soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
 
@@ -369,7 +462,7 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
                         logging.warning("TPDB session expired on item page for '%s' (%s).", item_title, current_url)
                         raise TPDBSessionExpired("TPDB session expired while loading item page.")
 
-                    _raise_if_rate_limited(selenium_driver.page_source, current_url)
+                    _raise_if_rate_limited(selenium_driver.page_source, current_url, "item_page")
                     _wait_for_item_posters_ready(selenium_driver, timeout=15)
                     item_soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
 
@@ -391,6 +484,14 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
                 if attempt == 0:
                     logging.warning("TPDB session expired; re-authenticating and retrying once for '%s'.", item_title)
                     setup_selenium_and_login(force=True)
+                    continue
+                raise
+            except TPDBRateLimited:
+                if attempt < 2:
+                    # A short backoff can help when TPDB serves an interstitial challenge page.
+                    backoff_sec = 2 + attempt * 2
+                    logging.warning("TPDB challenge/rate-limit detected for '%s'; retrying in %ss.", item_title, backoff_sec)
+                    time.sleep(backoff_sec)
                     continue
                 raise
 

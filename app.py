@@ -141,6 +141,9 @@ def get_item_posters(item_id):
             max_posters=Config.MAX_POSTERS_PER_ITEM
         )
         return jsonify({'item': item, 'posters': posters})
+    except TPDBRateLimited as e:
+        logging.warning(f"TPDB challenge/rate-limit for {item_id}: {e}")
+        return jsonify({'error': str(e), 'error_type': 'tpdb_rate_limited'}), 429
     except Exception as e:
         logging.error(f"Error getting posters for {item_id}: {e}")
         return jsonify({'error': str(e)}), 500
@@ -364,6 +367,62 @@ def health_check():
             'error': str(e),
             'selenium_active': selenium_driver is not None,
             'active_sessions': len(user_sessions)
+        }), 500
+
+@app.route('/debug/tpdb-search')
+def debug_tpdb_search():
+    """
+    Debug endpoint for TPDB scraping without depending on a Jellyfin item.
+    Enabled only in DEBUG mode.
+    """
+    if not Config.DEBUG:
+        return jsonify({'error': 'Not found'}), 404
+
+    if not selenium_ready_event.wait(timeout=30):
+        return jsonify({'error': 'Selenium is not ready'}), 503
+
+    title = (request.args.get('title') or '').strip()
+    if not title:
+        return jsonify({'error': 'Missing required query param: title'}), 400
+
+    item_type = request.args.get('type')  # Optional: Movie or Series
+    year = request.args.get('year', type=int)
+    tmdb_id = request.args.get('tmdb_id')
+    max_posters = request.args.get('max_posters', default=3, type=int)
+    max_posters = max(1, min(max_posters, 18))
+
+    try:
+        posters = search_tpdb_for_posters_multiple(
+            item_title=title,
+            item_year=year,
+            item_type=item_type,
+            tmdb_id=tmdb_id,
+            max_posters=max_posters,
+        )
+        return jsonify({
+            'success': True,
+            'title': title,
+            'item_type': item_type,
+            'year': year,
+            'tmdb_id': tmdb_id,
+            'selenium_url': _get_selenium_current_url(),
+            'poster_count': len(posters),
+            'posters': posters,
+        })
+    except TPDBRateLimited as e:
+        return jsonify({
+            'success': False,
+            'error_type': 'tpdb_rate_limited',
+            'error': str(e),
+            'selenium_url': _get_selenium_current_url(),
+        }), 429
+    except Exception as e:
+        logging.exception("Error in /debug/tpdb-search")
+        return jsonify({
+            'success': False,
+            'error_type': 'tpdb_debug_error',
+            'error': str(e),
+            'selenium_url': _get_selenium_current_url(),
         }), 500
 
 @app.route('/batch-auto-poster', methods=['POST'])
@@ -652,7 +711,6 @@ def create_placeholder_thumbnail():
 def background_setup():
     try:
         setup_selenium_and_login()
-        selenium_ready_event.set()
 
         try:
             server_info = get_jellyfin_server_info()
@@ -662,6 +720,10 @@ def background_setup():
 
     except Exception as e:
         logging.error(f"Failed to perform background setup: {e}")
+    finally:
+        # Always release startup waiters. If Selenium login failed, routes can still
+        # attempt setup on demand and return a concrete TPDB error instead of permanent 503.
+        selenium_ready_event.set()
 
 if __name__ == '__main__':
     setup_thread = threading.Thread(target=background_setup, daemon=True)

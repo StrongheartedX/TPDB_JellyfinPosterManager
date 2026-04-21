@@ -140,6 +140,18 @@ FLASK_DEBUG=True
 FLASK_ENV=development
 ```
 
+### TPDB Challenge Debugging
+
+If TPDB returns challenge/rate-limit pages during search, use this local debug flow:
+
+1. Ensure `DEBUG = True` and `TPDB_DEBUG_SNAPSHOTS = True` in `config.py`.
+2. Run the app and open:
+   - `GET /debug/tpdb-search?title=Inception&type=Movie&year=2010`
+3. If TPDB blocks the request, the API returns `429` with details and writes an HTML snapshot to `logs/`:
+   - `logs/tpdb_*_challenge_*.html`
+
+This makes it easy to inspect the exact returned page (Cloudflare/challenge/session-expired) and compare local vs deployed behavior.
+
 ## 🙏 Acknowledgments
 
 - **[Jellyfin](https://jellyfin.org/)** - The amazing open-source media server
