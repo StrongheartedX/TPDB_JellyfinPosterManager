@@ -3,16 +3,20 @@ import json
 from io import BytesIO
 from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 import time
 import re
 import os
 import hashlib
 import base64
+import threading
 from urllib.parse import quote_plus
 from config import Config
 import logging
@@ -20,6 +24,25 @@ from requests.exceptions import ChunkedEncodingError, ConnectionError
 
 # Global Selenium driver
 selenium_driver = None
+selenium_lock = threading.RLock()
+
+SEARCH_RESULT_SELECTOR = "a.btn.btn-dark-lighter.flex-grow-1.text-truncate.py-2.text-left.position-relative"
+ITEM_POSTER_SELECTOR = "a.bg-transparent.border-0.text-white"
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "checking your browser before accessing",
+    "attention required",
+    "cloudflare",
+)
+
+
+class TPDBSessionExpired(Exception):
+    """Raised when TPDB redirects Selenium back to /login."""
+
+
+class TPDBRateLimited(Exception):
+    """Raised when TPDB responds with a likely rate-limit/challenge page."""
 
 def _iter_file_chunks(file_obj, chunk_size=1024 * 1024):
     while True:
@@ -28,65 +51,120 @@ def _iter_file_chunks(file_obj, chunk_size=1024 * 1024):
             break
         yield data
 
-def setup_selenium_and_login():
+def _is_login_url(url):
+    return "/login" in (url or "").lower()
+
+
+def _raise_if_rate_limited(page_source, current_url):
+    page_lower = (page_source or "").lower()
+    if any(marker in page_lower for marker in RATE_LIMIT_MARKERS):
+        raise TPDBRateLimited(f"TPDB returned a rate-limit/challenge page at {current_url or 'unknown URL'}")
+
+
+def _wait_for_search_results_ready(driver, timeout=15):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.find_elements(By.CSS_SELECTOR, SEARCH_RESULT_SELECTOR)
+            or "no results" in (d.page_source or "").lower()
+            or "0 results" in (d.page_source or "").lower()
+        )
+    except TimeoutException as exc:
+        raise TimeoutError("Timed out waiting for TPDB search results page to load.") from exc
+
+
+def _wait_for_item_posters_ready(driver, timeout=15):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.find_elements(By.CSS_SELECTOR, ITEM_POSTER_SELECTOR)
+            or "no posters" in (d.page_source or "").lower()
+            or "no poster" in (d.page_source or "").lower()
+        )
+    except TimeoutException as exc:
+        raise TimeoutError("Timed out waiting for TPDB item poster page to load.") from exc
+
+
+def _get_selenium_current_url():
+    global selenium_driver
+    if not selenium_driver:
+        return None
+    try:
+        return selenium_driver.current_url
+    except Exception:
+        return None
+
+
+def setup_selenium_and_login(force=False):
     """
     Initialize a singleton Selenium driver and log into ThePosterDB.
     Safe to call multiple times; it will reuse the global driver if available.
+    force=True re-authenticates the existing driver session.
     """
     global selenium_driver
+    with selenium_lock:
+        if selenium_driver and not force:
+            logging.info("Selenium already initialized.")
+            return
 
-    if selenium_driver:
-        logging.info("Selenium already initialized.")
-        return
+        created_driver = False
+        if not selenium_driver:
+            chrome_options = Options()
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            selenium_driver = webdriver.Chrome(options=chrome_options)
+            selenium_driver.set_page_load_timeout(30)
+            created_driver = True
 
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    selenium_driver = webdriver.Chrome(options=chrome_options)
+        try:
+            selenium_driver.get("https://theposterdb.com/login")
+            WebDriverWait(selenium_driver, 15).until(EC.presence_of_element_located((By.NAME, "login")))
 
-    try:
-        # Login to TPDB
-        selenium_driver.get("https://theposterdb.com/login")
-        time.sleep(1.5)
+            email_input = selenium_driver.find_element(By.NAME, "login")
+            password_input = selenium_driver.find_element(By.NAME, "password")
+            email_input.clear()
+            email_input.send_keys(Config.TPDB_EMAIL)
+            password_input.clear()
+            password_input.send_keys(Config.TPDB_PASSWORD)
+            password_input.send_keys(Keys.RETURN)
 
-        email_input = selenium_driver.find_element(By.NAME, "login")
-        password_input = selenium_driver.find_element(By.NAME, "password")
-        email_input.clear()
-        email_input.send_keys(Config.TPDB_EMAIL)
-        password_input.clear()
-        password_input.send_keys(Config.TPDB_PASSWORD)
-        password_input.send_keys(Keys.RETURN)
-        time.sleep(4)  # Wait for login to complete
+            WebDriverWait(selenium_driver, 20).until(lambda d: not _is_login_url(d.current_url))
+            if _is_login_url(selenium_driver.current_url):
+                raise RuntimeError("TPDB login failed: still on /login after submitting credentials.")
 
-        logging.info("Selenium initialized and logged into ThePosterDB.")
-    except Exception as e:
-        logging.error(f"Failed to login to ThePosterDB: {e}")
-        teardown_selenium()
-        raise
+            if force:
+                logging.info("Selenium re-authenticated with ThePosterDB.")
+            else:
+                logging.info("Selenium initialized and logged into ThePosterDB.")
+        except Exception:
+            logging.exception("Failed to login to ThePosterDB (force=%s)", force)
+            if created_driver:
+                teardown_selenium()
+            raise
 
 def teardown_selenium():
     """Shutdown Selenium driver (only used on app shutdown)."""
     global selenium_driver
-    if selenium_driver:
-        try:
-            selenium_driver.quit()
-        except Exception:
-            pass
-        selenium_driver = None
+    with selenium_lock:
+        if selenium_driver:
+            try:
+                selenium_driver.quit()
+            except Exception:
+                pass
+            selenium_driver = None
 
 def get_selenium_cookies_as_dict():
     """Return Selenium cookies as a dict for requests.Session."""
     global selenium_driver
-    if not selenium_driver:
-        return {}
-    try:
-        cookies = selenium_driver.get_cookies()
-        return {cookie['name']: cookie['value'] for cookie in cookies}
-    except Exception:
-        return {}
+    with selenium_lock:
+        if not selenium_driver:
+            return {}
+        try:
+            cookies = selenium_driver.get_cookies()
+            return {cookie['name']: cookie['value'] for cookie in cookies}
+        except Exception:
+            return {}
 
 def download_image_with_cookies(url, save_path):
     """
@@ -96,24 +174,24 @@ def download_image_with_cookies(url, save_path):
         # Ensure target dir exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-        session = requests.Session()
-        session.cookies.update(get_selenium_cookies_as_dict())
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://theposterdb.com/",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-        })
-        response = session.get(url, stream=True, timeout=30)
-        if response.status_code == 200:
-            with open(save_path, "wb") as f:
-                for chunk in response.iter_content(8192):
-                    if chunk:
-                        f.write(chunk)
-            logging.info(f"Saved image to {save_path}")
-            return True
-        else:
-            logging.warning(f"Failed to download image from {url} (status {response.status_code})")
-            return False
+        with requests.Session() as session:
+            session.cookies.update(get_selenium_cookies_as_dict())
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://theposterdb.com/",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            })
+            response = session.get(url, stream=True, timeout=30)
+            if response.status_code == 200:
+                with open(save_path, "wb") as f:
+                    for chunk in response.iter_content(8192):
+                        if chunk:
+                            f.write(chunk)
+                logging.info(f"Saved image to {save_path}")
+                return True
+            else:
+                logging.warning(f"Failed to download image from {url} (status {response.status_code})")
+                return False
     except Exception as e:
         logging.error(f"Error downloading image from {url}: {e}")
         return False
@@ -170,21 +248,21 @@ def get_image_as_base64(image_url):
     Download image and convert to base64 data URL for embedding in UI.
     """
     try:
-        session = requests.Session()
-        session.cookies.update(get_selenium_cookies_as_dict())
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://theposterdb.com/",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-        })
+        with requests.Session() as session:
+            session.cookies.update(get_selenium_cookies_as_dict())
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://theposterdb.com/",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            })
 
-        logging.debug(f"Converting image to base64: {image_url}")
-        response = session.get(image_url, timeout=15)
-        response.raise_for_status()
+            logging.debug(f"Converting image to base64: {image_url}")
+            response = session.get(image_url, timeout=15)
+            response.raise_for_status()
 
-        image_data = base64.b64encode(response.content).decode('utf-8')
-        content_type = response.headers.get('content-type', 'image/jpeg')
-        return f"data:{content_type};base64,{image_data}"
+            image_data = base64.b64encode(response.content).decode('utf-8')
+            content_type = response.headers.get('content-type', 'image/jpeg')
+            return f"data:{content_type};base64,{image_data}"
     except Exception as e:
         logging.warning(f"Error converting image to base64: {e}")
         return None
@@ -195,8 +273,6 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
     item_type should be "Movie" or "Series" (Jellyfin item Type).
     """
     global selenium_driver
-    poster_data = []
-
     # Determine TMDB media type
     tmdb_type = None
     if item_type == "Movie":
@@ -241,73 +317,87 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
     logging.info(f"TPDB search URL: {search_url}")
 
     try:
-        if not selenium_driver:
-            setup_selenium_and_login()
-
-        selenium_driver.get(search_url)
-        time.sleep(1.5)
-        soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
-
-        # Search result links
-        search_result_links = soup.find_all(
-            "a",
-            class_="btn btn-dark-lighter flex-grow-1 text-truncate py-2 text-left position-relative"
-        )
-
-        if not search_result_links:
-            logging.info(f"No TPDB search results for '{search_query}'.")
-            return []
-
-        # Best match by simple title similarity
-        best_match = None
-        best_match_score = 0
-        for link in search_result_links:
+        poster_urls = []
+        for attempt in range(2):
             try:
-                title_element = link.find(class_="text-truncate") or link.find("span") or link
-                result_title = title_element.get_text(strip=True) if title_element else link.get_text(strip=True)
-                score = calculate_title_match_score(search_query, result_title)
-                if score > best_match_score:
-                    best_match_score = score
-                    best_match = link
-            except Exception:
-                continue
+                with selenium_lock:
+                    if not selenium_driver:
+                        setup_selenium_and_login()
 
-        selected_link = best_match if best_match and best_match_score >= 0.8 else search_result_links[0]
+                    selenium_driver.get(search_url)
+                    current_url = selenium_driver.current_url
+                    if _is_login_url(current_url):
+                        logging.warning("TPDB session expired on search page for '%s' (%s).", item_title, current_url)
+                        raise TPDBSessionExpired("TPDB session expired while loading search page.")
 
-        # Build item page URL
-        item_page_path = selected_link.get('href')
-        if not item_page_path:
-            return []
-        target_item_page_url = item_page_path if item_page_path.startswith('http') else (
-            Config.TPDB_BASE_URL + item_page_path if item_page_path.startswith('/') else None
-        )
-        if not target_item_page_url:
-            return []
+                    _raise_if_rate_limited(selenium_driver.page_source, current_url)
+                    _wait_for_search_results_ready(selenium_driver, timeout=15)
+                    soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
 
-        # Open item page and extract poster links
-        selenium_driver.get(target_item_page_url)
-        time.sleep(1.5)
-        item_soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
+                    search_result_links = soup.select(SEARCH_RESULT_SELECTOR)
+                    if not search_result_links:
+                        logging.info(f"No TPDB search results for '{search_query}'.")
+                        return []
 
-        poster_links = item_soup.find_all(
-            "a",
-            class_="bg-transparent border-0 text-white",
-            href=True
-        )[:max_posters]
+                    best_match = None
+                    best_match_score = 0
+                    for link in search_result_links:
+                        try:
+                            title_element = link.find(class_="text-truncate") or link.find("span") or link
+                            result_title = title_element.get_text(strip=True) if title_element else link.get_text(strip=True)
+                            score = calculate_title_match_score(search_query, result_title)
+                            if score > best_match_score:
+                                best_match_score = score
+                                best_match = link
+                        except Exception:
+                            continue
 
-        logging.info(f"Found {len(poster_links)} poster links; converting to base64 for preview")
+                    selected_link = best_match if best_match and best_match_score >= 0.8 else search_result_links[0]
 
-        for i, poster_link in enumerate(poster_links):
-            href = poster_link['href']
-            if href.startswith('http'):
-                poster_url = href
-            elif href.startswith('/'):
-                poster_url = Config.TPDB_BASE_URL + href
-            else:
-                continue
+                    item_page_path = selected_link.get('href')
+                    if not item_page_path:
+                        return []
+                    target_item_page_url = item_page_path if item_page_path.startswith('http') else (
+                        Config.TPDB_BASE_URL + item_page_path if item_page_path.startswith('/') else None
+                    )
+                    if not target_item_page_url:
+                        return []
 
+                    selenium_driver.get(target_item_page_url)
+                    current_url = selenium_driver.current_url
+                    if _is_login_url(current_url):
+                        logging.warning("TPDB session expired on item page for '%s' (%s).", item_title, current_url)
+                        raise TPDBSessionExpired("TPDB session expired while loading item page.")
+
+                    _raise_if_rate_limited(selenium_driver.page_source, current_url)
+                    _wait_for_item_posters_ready(selenium_driver, timeout=15)
+                    item_soup = BeautifulSoup(selenium_driver.page_source, 'html.parser')
+
+                    poster_links = item_soup.select(ITEM_POSTER_SELECTOR)[:max_posters]
+                    poster_urls = []
+                    for poster_link in poster_links:
+                        href = poster_link.get('href')
+                        if not href:
+                            continue
+                        if href.startswith('http'):
+                            poster_url = href
+                        elif href.startswith('/'):
+                            poster_url = Config.TPDB_BASE_URL + href
+                        else:
+                            continue
+                        poster_urls.append(poster_url)
+                break
+            except TPDBSessionExpired:
+                if attempt == 0:
+                    logging.warning("TPDB session expired; re-authenticating and retrying once for '%s'.", item_title)
+                    setup_selenium_and_login(force=True)
+                    continue
+                raise
+
+        logging.info(f"Found {len(poster_urls)} poster links; converting to base64 for preview")
+        poster_data = []
+        for i, poster_url in enumerate(poster_urls):
             base64_image = get_image_as_base64(poster_url)
-
             poster_data.append({
                 'id': i + 1,
                 'url': poster_url,
@@ -318,10 +408,14 @@ def search_tpdb_for_posters_multiple(item_title, item_year=None, item_type=None,
                 'likes': 0
             })
 
-    except Exception as e:
-        logging.error(f"Error during TPDB scraping: {e}")
-
-    return poster_data
+        return poster_data
+    except Exception:
+        logging.exception(
+            "Error during TPDB scraping: search_url=%s current_url=%s",
+            search_url,
+            _get_selenium_current_url(),
+        )
+        raise
 
 def extract_poster_metadata(poster_element):
     try:

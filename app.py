@@ -3,6 +3,7 @@ import uuid
 import json
 import os
 import logging
+import time
 from datetime import datetime
 from poster_scraper import *
 from config import Config
@@ -11,26 +12,68 @@ import threading
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# # Setup logging
-# if not os.path.exists(Config.LOG_DIR):
-#     os.makedirs(Config.LOG_DIR)
-
-# logging.basicConfig(
-#     level=logging.INFO if not Config.DEBUG else logging.DEBUG,
-#     format='%(asctime)s - %(levelname)s - %(message)s',
-#     handlers=[
-#         logging.FileHandler(f'{Config.LOG_DIR}/app.log'),
-#         logging.StreamHandler()
-#     ]
-# )
+# Setup logging
+os.makedirs(Config.LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO if not Config.DEBUG else logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'{Config.LOG_DIR}/app.log'),
+        logging.StreamHandler()
+    ]
+)
 
 # Global storage for session data
 user_sessions = {}
 selenium_ready_event = threading.Event()
+BATCH_DELAY_SEC = getattr(Config, 'TPDB_BATCH_DELAY_SEC', 1.5)
+
+
+def _evict_stale_user_sessions(max_age_sec=7200):
+    now_ts = time.time()
+    stale_session_ids = [
+        session_id
+        for session_id, session_data in list(user_sessions.items())
+        if now_ts - session_data.get('last_seen', now_ts) > max_age_sec
+    ]
+    for stale_session_id in stale_session_ids:
+        user_sessions.pop(stale_session_id, None)
+    if stale_session_ids:
+        logging.info("Evicted %d stale user sessions.", len(stale_session_ids))
+
+
+def _touch_session(session_id):
+    if session_id in user_sessions:
+        user_sessions[session_id]['last_seen'] = time.time()
+
+
+def _sweep_stale_temp_posters(max_age_sec=3600):
+    if not os.path.isdir(Config.TEMP_POSTER_DIR):
+        return
+
+    now_ts = time.time()
+    removed_count = 0
+    for file_name in os.listdir(Config.TEMP_POSTER_DIR):
+        if not (
+            (file_name.startswith("auto_") or file_name.startswith("manual_"))
+            and file_name.lower().endswith(".jpg")
+        ):
+            continue
+        file_path = os.path.join(Config.TEMP_POSTER_DIR, file_name)
+        try:
+            if now_ts - os.path.getmtime(file_path) > max_age_sec:
+                os.remove(file_path)
+                removed_count += 1
+        except Exception as cleanup_error:
+            logging.warning(f"Failed to sweep stale temp file {file_path}: {cleanup_error}")
+    if removed_count:
+        logging.info("Removed %d stale temp poster files.", removed_count)
 
 @app.route('/')
 def index():
     """Main page showing all Jellyfin items with server info"""
+    _evict_stale_user_sessions()
+
     session_id = session.get('session_id')
     if not session_id:
         session_id = str(uuid.uuid4())
@@ -52,7 +95,8 @@ def index():
             'items': jellyfin_items,
             'selections': {},
             'progress': 0,
-            'server_info': server_info
+            'server_info': server_info,
+            'last_seen': time.time()
         }
 
         return render_template('index.html',
@@ -80,6 +124,7 @@ def get_item_posters(item_id):
     session_id = session.get('session_id')
     if not session_id or session_id not in user_sessions:
         return jsonify({'error': 'Session not found'}), 400
+    _touch_session(session_id)
 
     items = user_sessions[session_id]['items']
     item = next((i for i in items if i['id'] == item_id), None)
@@ -106,6 +151,7 @@ def select_poster(item_id):
     session_id = session.get('session_id')
     if not session_id or session_id not in user_sessions:
         return jsonify({'error': 'Session not found'}), 400
+    _touch_session(session_id)
 
     data = request.get_json() or {}
     poster_url = data.get('poster_url')
@@ -127,6 +173,7 @@ def upload_poster(item_id):
     session_id = session.get('session_id')
     if not session_id or session_id not in user_sessions:
         return jsonify({'error': 'Session not found'}), 400
+    _touch_session(session_id)
 
     selections = user_sessions[session_id]['selections']
     if item_id not in selections:
@@ -141,8 +188,9 @@ def upload_poster(item_id):
 
     try:
         os.makedirs(Config.TEMP_POSTER_DIR, exist_ok=True)
+        _sweep_stale_temp_posters()
         safe_title = "".join(c for c in item['title'] if c.isalnum() or c in " _-").rstrip()
-        save_path = os.path.join(Config.TEMP_POSTER_DIR, f"{safe_title}_{item_id}.jpg")
+        save_path = os.path.join(Config.TEMP_POSTER_DIR, f"manual_{safe_title}_{item_id}.jpg")
 
         logging.info(f"Downloading poster for {item['title']}: {poster_url}")
 
@@ -177,12 +225,15 @@ def upload_all_selected():
     session_id = session.get('session_id')
     if not session_id or session_id not in user_sessions:
         return jsonify({'error': 'Session not found'}), 400
+    _touch_session(session_id)
 
     selections = user_sessions[session_id]['selections']
     items = user_sessions[session_id]['items']
     results = []
 
     logging.info(f"Starting batch upload of {len(selections)} items")
+    os.makedirs(Config.TEMP_POSTER_DIR, exist_ok=True)
+    _sweep_stale_temp_posters()
 
     for item_id, poster_url in selections.items():
         try:
@@ -191,9 +242,8 @@ def upload_all_selected():
                 results.append({'item_id': item_id, 'success': False, 'error': 'Item not found'})
                 continue
 
-            os.makedirs(Config.TEMP_POSTER_DIR, exist_ok=True)
             safe_title = "".join(c for c in item['title'] if c.isalnum() or c in " _-").rstrip()
-            save_path = os.path.join(Config.TEMP_POSTER_DIR, f"{safe_title}_{item_id}.jpg")
+            save_path = os.path.join(Config.TEMP_POSTER_DIR, f"manual_{safe_title}_{item_id}.jpg")
 
             if download_image_with_cookies(poster_url, save_path):
                 success = upload_image_to_jellyfin_improved(item_id, save_path)
@@ -266,15 +316,15 @@ def get_thumbnail():
         return create_placeholder_thumbnail(), 200
 
     try:
-        session_obj = requests.Session()
-        session_obj.cookies.update(get_selenium_cookies_as_dict())
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://theposterdb.com/",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-        }
-        response = session_obj.get(thumbnail_url, headers=headers, timeout=10)
-        response.raise_for_status()
+        with requests.Session() as session_obj:
+            session_obj.cookies.update(get_selenium_cookies_as_dict())
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://theposterdb.com/",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+            response = session_obj.get(thumbnail_url, headers=headers, timeout=10)
+            response.raise_for_status()
 
         return Response(
             response.content,
@@ -322,6 +372,8 @@ def batch_auto_poster():
     Automatically get and upload the first poster for items based on filter.
     """
     try:
+        _evict_stale_user_sessions()
+
         data = request.get_json() or {}
         target_filter = data.get('filter', 'no-poster')  # 'all', 'no-poster', 'movies', 'series'
 
@@ -375,8 +427,10 @@ def batch_auto_poster():
         results = []
         successful_count = 0
         failed_count = 0
+        rate_limited_error = None
 
         os.makedirs(Config.TEMP_POSTER_DIR, exist_ok=True)
+        _sweep_stale_temp_posters()
 
         for i, item in enumerate(target_items):
             try:
@@ -449,7 +503,18 @@ def batch_auto_poster():
                         'poster_url': poster_url
                     })
                     failed_count += 1
-
+            except TPDBRateLimited as e:
+                rate_limited_error = str(e)
+                logging.warning(f"TPDB rate-limit detected during batch; aborting early: {rate_limited_error}")
+                results.append({
+                    'item_id': item.get('id', 'Unknown'),
+                    'item_title': item.get('title', 'Unknown'),
+                    'success': False,
+                    'error': f'Aborted due to TPDB rate limit: {rate_limited_error}',
+                    'poster_url': None
+                })
+                failed_count += 1
+                break
             except Exception as e:
                 logging.error(f"Error processing item {item.get('title', 'Unknown')}: {e}")
                 results.append({
@@ -460,6 +525,19 @@ def batch_auto_poster():
                     'poster_url': None
                 })
                 failed_count += 1
+            finally:
+                time.sleep(BATCH_DELAY_SEC)
+
+        if rate_limited_error:
+            return jsonify({
+                'success': False,
+                'error': f'Batch aborted due to TPDB rate limit: {rate_limited_error}',
+                'results': results,
+                'total_items': len(target_items),
+                'processed': len(results),
+                'successful': successful_count,
+                'failed': failed_count
+            }), 429
 
         logging.info(f"Batch auto-poster completed: {successful_count} successful, {failed_count} failed")
 
@@ -518,6 +596,7 @@ def upload_poster_direct():
             logging.error("Selenium not ready in time for /upload-poster")
             return jsonify({'error': 'Backend service (Selenium) is not ready. Please try again in a moment.'}), 503
 
+        _evict_stale_user_sessions()
         data = request.get_json() or {}
         item_id = data.get('item_id')
         poster_url = data.get('poster_url')
@@ -525,12 +604,16 @@ def upload_poster_direct():
         if not item_id or not poster_url:
             return jsonify({'success': False, 'error': 'Missing item_id or poster_url'}), 400
 
-        items = user_sessions.get(session.get('session_id'), {}).get('items', [])
+        session_id = session.get('session_id')
+        if session_id in user_sessions:
+            _touch_session(session_id)
+        items = user_sessions.get(session_id, {}).get('items', [])
         item = next((i for i in items if i['id'] == item_id), None)
         if not item:
             return jsonify({'success': False, 'error': 'Item not found'}), 404
 
         os.makedirs(Config.TEMP_POSTER_DIR, exist_ok=True)
+        _sweep_stale_temp_posters()
         save_path = os.path.join(Config.TEMP_POSTER_DIR, f"manual_{item_id}.jpg")
 
         if download_image_with_cookies(poster_url, save_path):

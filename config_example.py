@@ -20,5 +20,6 @@ class Config:
 
     # Application Settings
     MAX_POSTERS_PER_ITEM = 18
+    TPDB_BATCH_DELAY_SEC = 1.5
     TEMP_POSTER_DIR = "temp_posters"
     LOG_DIR = "logs"
