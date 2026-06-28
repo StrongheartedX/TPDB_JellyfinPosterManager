@@ -144,7 +144,7 @@ let autoBatchPollTimer = null;
 let currentAutoBatchJobId = null;
 let autoBatchStartedAt = null;
 let latestAutoBatchJob = null;
-let activeGridStatusFilters = new Set();
+let activeGridStatusFilters = new Map();
 let manualQueueIds = new Set();
 let manualQueueOrder = [];
 let manualQueueResults = new Map();
@@ -341,23 +341,63 @@ function matchesGridStatusFilters(item) {
         locked: card?.classList.contains('protected-item') || protectedItemIds.has(itemId),
     };
 
-    for (const filter of activeGridStatusFilters) {
-        if (states[filter]) return true;
+    const includeFilters = [];
+    const excludeFilters = [];
+    activeGridStatusFilters.forEach((mode, filter) => {
+        if (mode === 'include') includeFilters.push(filter);
+        if (mode === 'exclude') excludeFilters.push(filter);
+    });
+
+    for (const filter of excludeFilters) {
+        if (states[filter]) return false;
     }
-    return false;
+
+    if (!includeFilters.length) return true;
+    return includeFilters.some(filter => states[filter]);
 }
 
-function setGridStatusFilter(checkbox) {
-    if (checkbox.checked) activeGridStatusFilters.add(checkbox.value);
-    else activeGridStatusFilters.delete(checkbox.value);
+function getNextGridStatusFilterMode(currentMode) {
+    if (!currentMode) return 'include';
+    if (currentMode === 'include') return 'exclude';
+    return '';
+}
+
+function renderGridStatusFilterButton(button, mode = button?.dataset.filterMode || '') {
+    if (!button) return;
+    const icon = button.querySelector('.grid-status-filter-icon');
+    const label = button.querySelector('.grid-status-filter-label');
+    const filterLabel = button.dataset.filterLabel || label?.textContent || '';
+    button.dataset.filterMode = mode;
+    button.classList.toggle('is-include', mode === 'include');
+    button.classList.toggle('is-exclude', mode === 'exclude');
+    button.setAttribute('aria-pressed', mode ? 'true' : 'false');
+    button.title = mode === 'include'
+        ? `Showing only ${filterLabel.toLowerCase()} items`
+        : mode === 'exclude'
+            ? `Hiding ${filterLabel.toLowerCase()} items`
+            : `Include or exclude ${filterLabel.toLowerCase()} items`;
+    if (icon) {
+        icon.className = mode === 'include'
+            ? 'fas fa-check grid-status-filter-icon'
+            : mode === 'exclude'
+                ? 'fas fa-times grid-status-filter-icon'
+                : 'far fa-square grid-status-filter-icon';
+    }
+}
+
+function setGridStatusFilter(button) {
+    const filter = button?.dataset.filter;
+    if (!filter) return;
+    const nextMode = getNextGridStatusFilterMode(activeGridStatusFilters.get(filter) || '');
+    if (nextMode) activeGridStatusFilters.set(filter, nextMode);
+    else activeGridStatusFilters.delete(filter);
+    renderGridStatusFilterButton(button, nextMode);
     applyGridFilters();
 }
 
 function clearGridStatusFilters() {
     activeGridStatusFilters.clear();
-    document.querySelectorAll('.grid-status-filter').forEach(checkbox => {
-        checkbox.checked = false;
-    });
+    document.querySelectorAll('.grid-status-filter').forEach(button => renderGridStatusFilterButton(button, ''));
     applyGridFilters();
 }
 

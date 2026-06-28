@@ -134,6 +134,39 @@ body {
 .automatic-batch-row { position: relative; z-index: 20; }
 .automatic-batch-card { position: relative; }
 #itemsGrid { position: relative; z-index: 1; }
+.grid-filter-menu { min-width: 190px; }
+.grid-status-filter {
+    align-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--border-radius-sm);
+    color: var(--app-text);
+    display: flex;
+    gap: 0.55rem;
+    margin-bottom: 0.35rem;
+    padding: 0.4rem 0.5rem;
+    text-align: left;
+    width: 100%;
+}
+.grid-status-filter:hover {
+    background: var(--surface-muted);
+    border-color: var(--border-color);
+}
+.grid-status-filter-icon {
+    color: var(--muted-color);
+    text-align: center;
+    width: 1rem;
+}
+.grid-status-filter.is-include {
+    background: rgba(40, 167, 69, 0.14);
+    border-color: rgba(40, 167, 69, 0.35);
+}
+.grid-status-filter.is-include .grid-status-filter-icon { color: var(--success-color); }
+.grid-status-filter.is-exclude {
+    background: rgba(220, 53, 69, 0.12);
+    border-color: rgba(220, 53, 69, 0.35);
+}
+.grid-status-filter.is-exclude .grid-status-filter-icon { color: var(--danger-color); }
 
 /* Selected counter */
 #selectedCount { font-weight: 600; color: var(--primary-color); }

@@ -289,22 +289,22 @@
             </button>
             <div class="dropdown-menu dropdown-menu-end grid-filter-menu" aria-labelledby="filterDropdownBtn">
                 <div class="small text-muted mb-2">Status</div>
-                <div class="form-check mb-2">
-                    <input class="form-check-input grid-status-filter" type="checkbox" value="processed" id="filterProcessed" onchange="setGridStatusFilter(this)">
-                    <label class="form-check-label" for="filterProcessed">Processed</label>
-                </div>
-                <div class="form-check mb-2">
-                    <input class="form-check-input grid-status-filter" type="checkbox" value="failed" id="filterFailed" onchange="setGridStatusFilter(this)">
-                    <label class="form-check-label" for="filterFailed">Failed</label>
-                </div>
-                <div class="form-check mb-2">
-                    <input class="form-check-input grid-status-filter" type="checkbox" value="queued" id="filterQueued" onchange="setGridStatusFilter(this)">
-                    <label class="form-check-label" for="filterQueued">Queued</label>
-                </div>
-                <div class="form-check mb-3">
-                    <input class="form-check-input grid-status-filter" type="checkbox" value="locked" id="filterLocked" onchange="setGridStatusFilter(this)">
-                    <label class="form-check-label" for="filterLocked">Locked</label>
-                </div>
+                <button class="grid-status-filter" type="button" data-filter="processed" data-filter-label="Processed" onclick="setGridStatusFilter(this)">
+                    <i class="far fa-square grid-status-filter-icon"></i>
+                    <span class="grid-status-filter-label">Processed</span>
+                </button>
+                <button class="grid-status-filter" type="button" data-filter="failed" data-filter-label="Failed" onclick="setGridStatusFilter(this)">
+                    <i class="far fa-square grid-status-filter-icon"></i>
+                    <span class="grid-status-filter-label">Failed</span>
+                </button>
+                <button class="grid-status-filter" type="button" data-filter="queued" data-filter-label="Queued" onclick="setGridStatusFilter(this)">
+                    <i class="far fa-square grid-status-filter-icon"></i>
+                    <span class="grid-status-filter-label">Queued</span>
+                </button>
+                <button class="grid-status-filter mb-3" type="button" data-filter="locked" data-filter-label="Locked" onclick="setGridStatusFilter(this)">
+                    <i class="far fa-square grid-status-filter-icon"></i>
+                    <span class="grid-status-filter-label">Locked</span>
+                </button>
                 <button class="btn btn-outline-secondary btn-sm w-100" type="button" onclick="clearGridStatusFilters()">
                     Clear filters
                 </button>
