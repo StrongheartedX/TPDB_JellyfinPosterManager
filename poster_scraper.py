@@ -630,6 +630,10 @@ def _build_tpdb_search_url(search_query, item_type=None):
     return search_url
 
 
+def _tpdb_search_term(search_query):
+    return strip_title_year(search_query) or search_query
+
+
 def _tpdb_url_with_query_params(url, **params):
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -687,7 +691,8 @@ def search_tpdb_for_poster_groups(
         if _season_key_from_jellyfin(season)
     }
     search_query = _resolve_tpdb_search_query(item_title, item_type=item_type, tmdb_id=tmdb_id)
-    search_url = _build_tpdb_search_url(search_query, item_type=item_type)
+    search_term = _tpdb_search_term(search_query)
+    search_url = _build_tpdb_search_url(search_term, item_type=item_type)
     tpdb_item_url = _tpdb_absolute_url(tpdb_item_url) if tpdb_item_url else None
     if tpdb_item_url:
         logging.info(f"Using saved TPDb page for '{search_query}': {tpdb_item_url}")
@@ -760,7 +765,7 @@ def search_tpdb_for_poster_groups(
                                 candidate_links.append({
                                     'title': display_title,
                                     'year': result_year,
-                                    'score': calculate_title_match_score(search_query, result_title),
+                                    'score': calculate_title_match_score(expected_title, result_title),
                                     'exact_title_match': exact_title_match,
                                     'exact_year_match': exact_title_match and (not expected_year or result_year == expected_year),
                                     'url': target_item_page_url,
