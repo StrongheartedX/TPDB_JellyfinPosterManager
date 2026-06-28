@@ -113,6 +113,8 @@ body {
 .item-card.failed-item .find-posters-overlay-btn { background: var(--danger-color); border-color: var(--danger-color); color: #fff; }
 .manual-queue-checkbox:checked + .manual-queue-label { background: var(--info-color); border-color: var(--info-color); color: #fff; }
 .manual-queue-label.queued-for-upload { background: var(--warning-color); border-color: var(--warning-color); color: #111; }
+.manual-queue-label.uploading-selection { background: var(--info-color); border-color: var(--info-color); color: #fff; }
+.manual-queue-label.uploaded-selection { background: var(--success-color); border-color: var(--success-color); color: #fff; }
 .season-count-button { background: transparent; border: 0; color: inherit; padding: 0; font: inherit; }
 .season-count-button:hover { color: var(--primary-color); text-decoration: underline; }
 .processed-item-overlay { position: absolute; top: 0.5rem; left: 0.5rem; z-index: 10; }

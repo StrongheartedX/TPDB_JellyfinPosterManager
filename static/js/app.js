@@ -1613,15 +1613,35 @@ function applyGroupedSelectionHighlight() {
     });
 }
 
-function setManualQueueUploadState(itemId, queuedForUpload) {
+function setManualQueueUploadState(itemId, state) {
     const checkbox = document.querySelector(`.manual-queue-checkbox[data-item-id="${cssEscapeValue(itemId)}"]`);
     const label = checkbox?.nextElementSibling;
     if (!label?.classList.contains('manual-queue-label')) return;
 
-    label.classList.toggle('queued-for-upload', queuedForUpload);
-    label.innerHTML = queuedForUpload
-        ? '<i class="fas fa-clock me-1"></i>Queued for Upload'
-        : '<i class="fas fa-list-check me-1"></i>Queue';
+    const normalizedState = state === true ? 'queued' : state || 'idle';
+    const states = {
+        idle: {
+            className: '',
+            html: '<i class="fas fa-list-check me-1"></i>Queue'
+        },
+        queued: {
+            className: 'queued-for-upload',
+            html: '<i class="fas fa-clock me-1"></i>Queued for Upload'
+        },
+        uploading: {
+            className: 'uploading-selection',
+            html: '<i class="fas fa-spinner fa-spin me-1"></i>Uploading'
+        },
+        uploaded: {
+            className: 'uploaded-selection',
+            html: '<i class="fas fa-check me-1"></i>Uploaded'
+        }
+    };
+    const nextState = states[normalizedState] || states.idle;
+
+    label.classList.remove('queued-for-upload', 'uploading-selection', 'uploaded-selection');
+    if (nextState.className) label.classList.add(nextState.className);
+    label.innerHTML = nextState.html;
     applyGridFilters();
 }
 
@@ -1686,31 +1706,27 @@ function updateItemStatus(itemId, status) {
         case 'selected':
             statusElement.innerHTML = '';
             itemCard.classList.add('selected');
-            setManualQueueUploadState(itemId, true);
+            setManualQueueUploadState(itemId, 'queued');
             break;
 
         case 'uploading':
-            statusElement.innerHTML = `
-                <span class="badge bg-info">
-                    <i class="fas fa-spinner fa-spin me-1"></i>Uploading...
-                </span>
-            `;
+            statusElement.innerHTML = '';
+            setManualQueueUploadState(itemId, 'uploading');
             break;
 
         case 'uploaded':
-            statusElement.innerHTML = `
-                <span class="badge status-uploaded">
-                    <i class="fas fa-check-circle me-1"></i>Uploaded!
-                </span>
-            `;
+            statusElement.innerHTML = '';
             itemCard.classList.remove('selected');
             delete selectedPosters[itemId];
             manualQueueSelectionIds.delete(itemId);
-            setManualQueueUploadState(itemId, false);
+            setManualQueueUploadState(itemId, 'uploaded');
             updateUploadAllButton();
             break;
 
         case 'error':
+            if (selectedPosters[itemId]) {
+                setManualQueueUploadState(itemId, 'queued');
+            }
             statusElement.innerHTML = `
                 <span class="badge status-error">
                     <i class="fas fa-exclamation-triangle me-1"></i>Error
@@ -1777,6 +1793,7 @@ async function uploadAllSelected() {
         uploadBtn.classList.add('is-expanded');
         uploadBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Uploading...';
     }
+    Object.keys(selectedPosters).forEach(itemId => updateItemStatus(itemId, 'uploading'));
 
     try {
         const response = await fetch('/upload-all', { method: 'POST' });
